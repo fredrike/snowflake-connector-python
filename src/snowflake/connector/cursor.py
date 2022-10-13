@@ -107,7 +107,9 @@ STATEMENT_TYPE_ID_DML_SET = frozenset(
     ]
 )
 
-DESC_TABLE_RE = re.compile(r"desc(?:ribe)?\s+([\w_]+)\s*;?\s*$", flags=re.IGNORECASE)
+DESC_TABLE_RE = re.compile(
+    r"desc(?:ribe)?\s+([\w_]+)\s*(?:;?\s*$|;)", flags=re.IGNORECASE
+)
 
 LOG_MAX_QUERY_LENGTH = 80
 
@@ -237,6 +239,9 @@ class SnowflakeCursor:
         self._sequence_counter = -1
         self._request_id = None
         self._is_file_transfer = False
+        self._is_multi_statement = False
+        self._is_multi_exec_async = False
+        self._multi_statement_results = []
 
         self._timestamp_output_format = None
         self._timestamp_ltz_output_format = None
@@ -365,6 +370,11 @@ class SnowflakeCursor:
     def is_file_transfer(self):
         """Whether the command is PUT or GET."""
         return hasattr(self, "_is_file_transfer") and self._is_file_transfer
+
+    @property
+    def is_multi_statement(self):
+        """Whether the command is a multi-statement"""
+        return hasattr(self, "_is_multi_statement") and self._is_multi_statement
 
     @property
     def lastrowid(self) -> None:
@@ -590,6 +600,7 @@ class SnowflakeCursor:
         _raise_put_get_error: bool = True,
         _force_put_overwrite: bool = False,
         file_stream: IO[bytes] | None = None,
+        _num_statements: int | None = None,
     ) -> SnowflakeCursor | None:
         """Executes a command/query.
 
@@ -619,6 +630,8 @@ class SnowflakeCursor:
             _force_put_overwrite: If the SQL query is a PUT, then this flag can force overwriting of an already
                 existing file on stage.
             file_stream: File-like object to be uploaded with PUT
+            _num_statements: Query level parameter to submit in _statement_params constraining exact number of
+            statements being submitted if providing a multi-statement query.
 
         Returns:
             The cursor itself, or None if some error happened, or the response returned
@@ -641,6 +654,12 @@ class SnowflakeCursor:
         if not command:
             logger.warning("execute: no query is given to execute")
             return
+
+        if _num_statements:
+            if _statement_params:
+                _statement_params["MULTI_STATEMENT_COUNT"] = _num_statements
+            else:
+                _statement_params = {"MULTI_STATEMENT_COUNT": _num_statements}
 
         kwargs = {
             "timeout": timeout,
@@ -701,7 +720,7 @@ class SnowflakeCursor:
 
         m = DESC_TABLE_RE.match(query)
         if m:
-            query1 = f"describe table {m.group(1)}"
+            query1 = re.sub(DESC_TABLE_RE, r"describe table \1;", query)
             if logger.getEffectiveLevel() <= logging.WARNING:
                 logger.info(
                     "query was rewritten: org=%s, new=%s",
@@ -718,11 +737,26 @@ class SnowflakeCursor:
             if "data" in ret and "queryId" in ret["data"]
             else None
         )
+        logger.debug("sfqid: %s", self.sfqid)
         self._sqlstate = (
             ret["data"]["sqlState"]
             if "data" in ret and "sqlState" in ret["data"]
             else None
         )
+        logger.info("query execution done")
+
+        if "resultIds" in ret["data"]:
+            self._is_multi_statement = True
+            self._multi_statement_results = ret["data"]["resultIds"].split(",")
+            self._is_multi_exec_async = _exec_async
+            if self._is_file_transfer:
+                logger.warning(
+                    "PUT/GET commands are not supported for multi-statement queries and will be ignored."
+                )
+                self._is_file_transfer = False
+            self.nextset()
+            return self
+
         self._first_chunk_time = get_time_millis()
 
         # if server gives a send time, log the time it took to arrive
@@ -733,9 +767,7 @@ class SnowflakeCursor:
             self._log_telemetry_job_data(
                 TelemetryField.TIME_CONSUME_FIRST_RESULT, time_consume_first_result
             )
-        logger.debug("sfqid: %s", self.sfqid)
 
-        logger.info("query execution done")
         if ret["success"]:
             logger.debug("SUCCESS")
             data = ret["data"]
@@ -1154,8 +1186,25 @@ class SnowflakeCursor:
         return ret
 
     def nextset(self):
-        """Not supported."""
-        logger.debug("nop")
+        """
+        Fetches the next set of results if the previously executed query was multi-statement so that subsequent calls
+        to any of the fetch*() methods will return rows from the next query's set of results. Returns None if no more
+        query results are available.
+        """
+        self.reset()
+        if self._multi_statement_results:
+            if self._is_multi_exec_async:
+                self.get_results_from_sfqid(self._multi_statement_results[0])
+            else:
+                self.query_result(self._multi_statement_results[0])
+            logger.info(
+                "Retrieving results for query ID: %s",
+                self._multi_statement_results.pop(0),
+            )
+            return self
+
+        self._is_multi_statement = False
+        self._is_multi_exec_async = False
         return None
 
     def setinputsizes(self, _):
